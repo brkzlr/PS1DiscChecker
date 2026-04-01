@@ -143,9 +143,15 @@ int main(int argc, char** argv)
 	long fileSize = ftell(file);
 	fseek(file, 0, SEEK_SET);
 
+	if (fileSize % SECTOR_SIZE != 0) {
+		puts("Bin file is not a multiple of sector size... File may be corrupted!");
+		fclose(file);
+		return 1;
+	}
+
 	bool invalidEDC = false;
 	Sector_t sector;
-	while (ftell(file) < fileSize) {
+	while (!feof(file)) {
 		fread(sector.buffer, 1, SECTOR_SIZE, file);
 
 		SectorAddress_t sectAddr = { sector.header[0], sector.header[1], sector.header[2] };
@@ -164,15 +170,17 @@ int main(int argc, char** argv)
 		const uint8_t formType = CheckSubmodeBits(sector.subheader[2], SB_FORM) + 1; // Form 1 returns false (0), Form 2 returns true (1)
 		const uint16_t dataSize = formType == 2 ? SECTOR_FORM2_DATA_SIZE : SECTOR_FORM1_DATA_SIZE;
 
-		uint32_t* crcPtr = (uint32_t*)&sector.data[dataSize];
-		uint32_t crc = CalculateEDC(sector.buffer + SECTOR_SYNC_SIZE + SECTOR_HEADER_SIZE, SECTOR_SUBHEADER_SIZE + dataSize);
-		if (*crcPtr != crc) {
+		uint32_t discCrc;
+		memcpy(&discCrc, &sector.data[dataSize], sizeof(uint32_t));
+
+		uint32_t calculatedCrc = CalculateEDC(sector.buffer + SECTOR_SYNC_SIZE + SECTOR_HEADER_SIZE, SECTOR_SUBHEADER_SIZE + dataSize);
+		if (discCrc != calculatedCrc) {
 			invalidEDC = true;
 			if (isVerbose) {
 				uint32_t sectorNumber = GetSectorNumber(&sectAddr);
 				printf("Found mismatch at Sector %d, mode %d, form %d\n", sectorNumber, sector.header[3], formType);
-				printf("Found EDC: %X\n", *crcPtr);
-				printf("Calculated EDC: %X\n", crc);
+				printf("Found EDC: %X\n", discCrc);
+				printf("Calculated EDC: %X\n", calculatedCrc);
 			}
 			else {
 				// We want an early break if we don't care to show what sectors are broken in non-verbose mode

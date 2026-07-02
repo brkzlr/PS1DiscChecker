@@ -15,23 +15,49 @@
         along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
-#include <assert.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
-#define CTR 0
-#define CBC 0
 #include "aes.h"
 #include "sha1.h"
 
 #define SALT_SIZE 0x14
 #define HASH_SIZE 0x14
 #define MAX_SAVE_BLOCKS 0xF
+
+static inline void WriteLE16(uint8_t* dst, uint16_t value)
+{
+	dst[0] = value & 0xFF;
+	dst[1] = (value >> 8) & 0xFF;
+}
+
+static inline void WriteLE32(uint8_t* dst, uint32_t value)
+{
+	dst[0] = value & 0xFF;
+	dst[1] = (value >> 8) & 0xFF;
+	dst[2] = (value >> 16) & 0xFF;
+	dst[3] = (value >> 24) & 0xFF;
+}
+
+static inline uint16_t ReadLE16(const uint8_t* src)
+{
+	return (uint16_t)(src[0] | (src[1] << 8));
+}
+
+static inline uint32_t ReadLE32(const uint8_t* src)
+{
+	return (uint32_t)src[0] | ((uint32_t)src[1] << 8) | ((uint32_t)src[2] << 16) | ((uint32_t)src[3] << 24);
+}
+
+static inline const char* GetBaseName(const char* path)
+{
+	const char* baseName = strrchr(path, '/');
+	return baseName ? baseName + 1 : path;
+}
 
 // All of the fields below are array type to guarantee a packed struct with no padding in a portable way.
 // Otherwise having some of them as uint32_t would've been more helpful.
@@ -149,7 +175,15 @@ static void CreatePSVFromSave(FILE* file, const char* fileName, size_t blockCoun
 
 	// Create our virtual PSV and copy the PS1 save into the save container
 	PSVFile_t* psvFile = (PSVFile_t*)calloc(1, cPSVSize);
-	fread(&psvFile->save, sizeof(SaveBlock_t), blockCount, file);
+	if (!psvFile) {
+		printf("Failed to allocate memory for '%s'! Skipping...\n", fileName);
+		return;
+	}
+	if (fread(&psvFile->save, sizeof(SaveBlock_t), blockCount, file) != blockCount) {
+		printf("Failed to read save data from '%s'! Skipping...\n", fileName);
+		free(psvFile);
+		return;
+	}
 
 	// Fill in necessary header data.
 	memcpy(psvFile->header.magic, "\0VSP", 4);
@@ -158,12 +192,12 @@ static void CreatePSVFromSave(FILE* file, const char* fileName, size_t blockCoun
 	psvFile->header.type[0] = 1; // Ditto
 	psvFile->header.slotStartOffset[0] = 0x84; // Ditto
 	psvFile->header.dataStartOffset[1] = 0x02; // Ditto
-	*(uint32_t*)psvFile->header.saveSize = 0x2000 * blockCount;
-	*(uint32_t*)psvFile->header.saveSizeDup = *(uint32_t*)psvFile->header.saveSize;
-	*(uint32_t*)psvFile->header.unknown = 0x9003;
+	WriteLE32(psvFile->header.saveSize, (uint32_t)(0x2000 * blockCount));
+	WriteLE32(psvFile->header.saveSizeDup, (uint32_t)(0x2000 * blockCount));
+	WriteLE32(psvFile->header.unknown, 0x9003);
 
 	// PS1 filename is important for proper PSV header creation but will not bother safety checking if name was tampered with... user error
-	strncpy((char*)psvFile->header.fileName, fileName, sizeof(psvFile->header.fileName));
+	strncpy((char*)psvFile->header.fileName, GetBaseName(fileName), sizeof(psvFile->header.fileName));
 
 	// Sign the PSV once we have all of the data set up.
 	SignFile(psvFile->header.hash, (uint8_t*)psvFile, cPSVSize, psvFile->header.salt);
@@ -196,21 +230,37 @@ static void CreatePSVFromSave(FILE* file, const char* fileName, size_t blockCoun
 		return;
 	}
 
-	fwrite((uint8_t*)psvFile, cPSVSize, 1, outputFile);
-	printf("'%s' created successfully!\n", outputFileName);
+	if (fwrite((uint8_t*)psvFile, cPSVSize, 1, outputFile) != 1) {
+		printf("Failed to write PSV data to '%s'!\n", outputFileName);
+	}
+	else {
+		printf("'%s' created successfully!\n", outputFileName);
+	}
 
 	fclose(outputFile);
 	free(psvFile);
 }
 
-static void ExtractSaveFromPSV(PSVFile_t* psvFile)
+static void ExtractSaveFromPSV(PSVFile_t* psvFile, size_t saveDataSize)
 {
 	if (!psvFile) {
 		return;
 	}
 
+	const uint32_t cSaveSize = ReadLE32(psvFile->header.saveSize);
+	if (cSaveSize == 0 || cSaveSize != saveDataSize || cSaveSize > MAX_SAVE_BLOCKS * sizeof(SaveBlock_t)) {
+		puts("PSV header's save size doesn't match its file size! Skipping corrupted file...");
+		return;
+	}
+
 	char outputFileName[sizeof(psvFile->header.fileName) + 1];
-	strncpy(outputFileName, (const char*)psvFile->header.fileName, sizeof(outputFileName));
+	memcpy(outputFileName, psvFile->header.fileName, sizeof(psvFile->header.fileName));
+	outputFileName[sizeof(psvFile->header.fileName)] = 0;
+
+	if (outputFileName[0] == 0 || strchr(outputFileName, '/')) {
+		puts("PSV contains an invalid save file name! Skipping...");
+		return;
+	}
 
 	FILE* outputFile = fopen(outputFileName, "wb");
 	if (!outputFile) {
@@ -218,10 +268,13 @@ static void ExtractSaveFromPSV(PSVFile_t* psvFile)
 		return;
 	}
 
-	const size_t cBlockCount = *(uint32_t*)psvFile->header.saveSize / sizeof(SaveBlock_t);
-
-	fwrite(&psvFile->save, sizeof(SaveBlock_t), cBlockCount, outputFile);
-	printf("Extracted '%s' successfully!\n", outputFileName);
+	const size_t cBlockCount = cSaveSize / sizeof(SaveBlock_t);
+	if (fwrite(&psvFile->save, sizeof(SaveBlock_t), cBlockCount, outputFile) != cBlockCount) {
+		printf("Failed to write save data to '%s'!\n", outputFileName);
+	}
+	else {
+		printf("Extracted '%s' successfully!\n", outputFileName);
+	}
 	fclose(outputFile);
 }
 
@@ -296,6 +349,10 @@ static inline uint8_t XorBuf(const uint8_t* buffer, size_t bufferLen)
 static void CreateVMPFromSaves(const char* files[], size_t filesCount)
 {
 	VMPFile_t* vmpFile = (VMPFile_t*)calloc(1, sizeof(VMPFile_t));
+	if (!vmpFile) {
+		puts("Failed to allocate memory for the VMP file! Aborting...");
+		return;
+	}
 
 	// Fill in necessary VMP header data.
 	memcpy(vmpFile->header.magic, "\0PMV\x80", 5);
@@ -331,7 +388,7 @@ static void CreateVMPFromSaves(const char* files[], size_t filesCount)
 
 		fseek(file, 0, SEEK_END);
 		const long cFileSize = ftell(file);
-		if (cFileSize == 0 || cFileSize % sizeof(SaveBlock_t) != 0) {
+		if (cFileSize <= 0 || cFileSize % sizeof(SaveBlock_t) != 0) {
 			printf("Input file '%s' is not a valid PS1 save! Skipping...\n", files[fileIndex]);
 			fclose(file);
 			continue;
@@ -339,13 +396,23 @@ static void CreateVMPFromSaves(const char* files[], size_t filesCount)
 		fseek(file, 0, SEEK_SET);
 
 		// Do we have space for however many blocks this save occupies?
-		const long cBlockCount = cFileSize / sizeof(SaveBlock_t);
+		const size_t cBlockCount = cFileSize / sizeof(SaveBlock_t);
 		if (allocatedBlocks + cBlockCount > MAX_SAVE_BLOCKS) {
 			printf("'%s' exceeds available VMP save blocks! Skipping...\n", files[fileIndex]);
+			fclose(file);
 			continue;
 		}
 
 		printf("Processing '%s'\n", files[fileIndex]);
+		// Read the save data in before touching the directory frames so a failed read can't leave frames pointing at blocks that were never filled.
+		if (fread(&vmpFile->card.saveBlocks[allocatedBlocks], sizeof(SaveBlock_t), cBlockCount, file) != cBlockCount) {
+			printf("Failed to read save data from '%s'! Skipping...\n", files[fileIndex]);
+			memset(&vmpFile->card.saveBlocks[allocatedBlocks], 0, sizeof(SaveBlock_t) * cBlockCount);
+			fclose(file);
+			continue;
+		}
+		fclose(file);
+
 		for (size_t i = allocatedBlocks; i < allocatedBlocks + cBlockCount; ++i) {
 			DirectoryFrame_t* directory = &vmpFile->card.directoryFrames[i];
 
@@ -354,39 +421,36 @@ static void CreateVMPFromSaves(const char* files[], size_t filesCount)
 			if (i == allocatedBlocks) {
 				directory->blockState[0] = FIRST_LINK_OR_ONLY;
 				if (cBlockCount == 1) {
-					*(uint16_t*)directory->nextBlockNr = 0xFFFF;
+					WriteLE16(directory->nextBlockNr, 0xFFFF);
 				}
 				else {
-					*(uint16_t*)directory->nextBlockNr = i + 1;
+					WriteLE16(directory->nextBlockNr, (uint16_t)(i + 1));
 				}
-				*(uint32_t*)directory->saveSize = 0x2000 * cBlockCount;
-				strncpy((char*)directory->fileName, files[fileIndex], sizeof(directory->fileName) - 1);
+				WriteLE32(directory->saveSize, (uint32_t)(0x2000 * cBlockCount));
+				strncpy((char*)directory->fileName, GetBaseName(files[fileIndex]), sizeof(directory->fileName) - 1);
 				directory->fileName[0x14] = 0;
 			}
 			// Middle block
 			else if (i + 1 < allocatedBlocks + cBlockCount) {
 				directory->blockState[0] = MIDDLE_LINK;
-				*(uint16_t*)directory->nextBlockNr = i + 1;
+				WriteLE16(directory->nextBlockNr, (uint16_t)(i + 1));
 			}
 			// Last block
 			else {
 				directory->blockState[0] = LAST_LINK;
-				*(uint16_t*)directory->nextBlockNr = 0xFFFF;
+				WriteLE16(directory->nextBlockNr, 0xFFFF);
 			}
 
 			directory->checksum = XorBuf((uint8_t*)directory, sizeof(DirectoryFrame_t) - 1);
 		}
 
-		fread(&vmpFile->card.saveBlocks[allocatedBlocks], sizeof(SaveBlock_t), cBlockCount, file);
 		allocatedBlocks += cBlockCount;
-
-		fclose(file);
 	}
 
 	// Set remaining blocks as empty sectors
 	for (size_t i = allocatedBlocks; i < MAX_SAVE_BLOCKS; ++i) {
 		vmpFile->card.directoryFrames[i].blockState[0] = FREE_BLOCK;
-		*(uint16_t*)vmpFile->card.directoryFrames[i].nextBlockNr = 0xFFFF;
+		WriteLE16(vmpFile->card.directoryFrames[i].nextBlockNr, 0xFFFF);
 		vmpFile->card.directoryFrames[i].checksum = 0xA0;
 	}
 
@@ -401,8 +465,12 @@ static void CreateVMPFromSaves(const char* files[], size_t filesCount)
 		return;
 	}
 
-	fwrite((uint8_t*)vmpFile, sizeof(VMPFile_t), 1, outputFile);
-	puts("VMP created successfully!");
+	if (fwrite((uint8_t*)vmpFile, sizeof(VMPFile_t), 1, outputFile) != 1) {
+		puts("Failed to write VMP data to disk!");
+	}
+	else {
+		puts("VMP created successfully!");
+	}
 
 	fclose(outputFile);
 	free(vmpFile);
@@ -430,44 +498,61 @@ static void ExtractSavesFromVMP(VMPFile_t* vmpFile)
 			printf("Found deleted save block %zu in VMP, but will ignore it\n", frameIndex + 1);
 			continue;
 		case FIRST_LINK_OR_ONLY: {
-			FILE* outputFile = fopen((const char*)directory->fileName, "wb");
-			if (!outputFile) {
-				printf("Couldn't create '%s' save file! Skipping...\n", (const char*)directory->fileName);
+			directory->fileName[sizeof(directory->fileName) - 1] = 0;
+			const char* saveName = (const char*)directory->fileName;
+			if (saveName[0] == 0 || strchr(saveName, '/')) {
+				printf("Block %zu has an invalid file name! Skipping save...\n", frameIndex + 1);
 				continue;
 			}
 
+			const uint32_t cSaveSize = ReadLE32(directory->saveSize);
+			bool corrupted;
 			// Single block save
-			if (*(uint16_t*)directory->nextBlockNr == 0xFFFF) {
-				if (*(uint32_t*)directory->saveSize != sizeof(SaveBlock_t)) {
-					printf("Block %zu for save '%s' is corrupted! Skipping save...\n", frameIndex + 1, (const char*)directory->fileName);
-					continue;
-				}
-				fwrite(&vmpFile->card.saveBlocks[frameIndex], sizeof(SaveBlock_t), 1, outputFile);
+			if (ReadLE16(directory->nextBlockNr) == 0xFFFF) {
+				corrupted = cSaveSize != sizeof(SaveBlock_t);
 			}
 			// Multiple blocks save
 			else {
-				if (*(uint32_t*)directory->saveSize % sizeof(SaveBlock_t) != 0) {
-					printf("Block %zu for save '%s' is corrupted! Skipping save...\n", frameIndex + 1, (const char*)directory->fileName);
-					continue;
-				}
-				size_t blockToWrite = frameIndex;
-				const size_t cBlockCount = (*(uint32_t*)directory->saveSize / sizeof(SaveBlock_t));
-				for (size_t i = 0; i < cBlockCount; ++i) {
-					fwrite(&vmpFile->card.saveBlocks[blockToWrite], sizeof(SaveBlock_t), 1, outputFile);
-
-					uint16_t nextBlockIndex = *(uint16_t*)directory->nextBlockNr;
-					if (nextBlockIndex >= MAX_SAVE_BLOCKS) {
-						// Set back directory ptr to original value from beginning of loop for correct fileName print at the end
-						directory = &vmpFile->card.directoryFrames[frameIndex];
-						// This'll happen on the last iteration and we don't want an out of bounds access below
-						break;
-					}
-					directory = &vmpFile->card.directoryFrames[nextBlockIndex];
-					blockToWrite = nextBlockIndex;
-				}
+				corrupted = cSaveSize < 2 * sizeof(SaveBlock_t)
+				    || cSaveSize > MAX_SAVE_BLOCKS * sizeof(SaveBlock_t)
+				    || cSaveSize % sizeof(SaveBlock_t) != 0;
+			}
+			if (corrupted) {
+				printf("Block %zu for save '%s' is corrupted! Skipping save...\n", frameIndex + 1, saveName);
+				continue;
 			}
 
-			printf("Extracted '%s' successfully!\n", (const char*)directory->fileName);
+			FILE* outputFile = fopen(saveName, "wb");
+			if (!outputFile) {
+				printf("Couldn't create '%s' save file! Skipping...\n", saveName);
+				continue;
+			}
+
+			size_t blockToWrite = frameIndex;
+			const size_t cBlockCount = cSaveSize / sizeof(SaveBlock_t);
+			const DirectoryFrame_t* chainFrame = directory;
+			bool writeOk = true;
+			for (size_t i = 0; i < cBlockCount; ++i) {
+				if (fwrite(&vmpFile->card.saveBlocks[blockToWrite], sizeof(SaveBlock_t), 1, outputFile) != 1) {
+					writeOk = false;
+					break;
+				}
+
+				const uint16_t nextBlockIndex = ReadLE16(chainFrame->nextBlockNr);
+				if (nextBlockIndex >= MAX_SAVE_BLOCKS) {
+					// This'll happen on the last iteration and we don't want an out of bounds access below
+					break;
+				}
+				chainFrame = &vmpFile->card.directoryFrames[nextBlockIndex];
+				blockToWrite = nextBlockIndex;
+			}
+
+			if (writeOk) {
+				printf("Extracted '%s' successfully!\n", saveName);
+			}
+			else {
+				printf("Failed to write save data to '%s'!\n", saveName);
+			}
 			fclose(outputFile);
 		}
 		}
@@ -481,20 +566,20 @@ int main(int argc, char** argv)
 	bool vmp = false;
 
 	// VMP supports max 15 saves, just like a Memory Card
-	const char* fileNames[15] = { NULL };
+	const char* fileNames[MAX_SAVE_BLOCKS] = { NULL };
 	size_t fileCount = 0;
-	for (size_t i = 1; i < argc; ++i) {
-		if (!strncmp(argv[i], "-e", 2)) {
+	for (int i = 1; i < argc; ++i) {
+		if (!strcmp(argv[i], "-e")) {
 			extract = true;
 		}
-		else if (!strncmp(argv[i], "-p", 2)) {
+		else if (!strcmp(argv[i], "-p")) {
 			psv = true;
 		}
-		else if (!strncmp(argv[i], "-v", 2)) {
+		else if (!strcmp(argv[i], "-v")) {
 			vmp = true;
 		}
 		else {
-			if (fileCount == 15) {
+			if (fileCount == MAX_SAVE_BLOCKS) {
 				puts("Can't accept more than 15 files! Quitting...");
 				return 1;
 			}
@@ -526,8 +611,8 @@ int main(int argc, char** argv)
 
 			fseek(file, 0, SEEK_END);
 			const long cFileSize = ftell(file);
-			if (cFileSize == 0) {
-				printf("Input file '%s' is empty! Skipping...\n", fileNames[i]);
+			if (cFileSize <= 0) {
+				printf("Input file '%s' is empty or unreadable! Skipping...\n", fileNames[i]);
 				fclose(file);
 				continue;
 			}
@@ -535,22 +620,36 @@ int main(int argc, char** argv)
 
 			if (extract) {
 				char fileTypeId[5];
-				fread(fileTypeId, 5, 1, file);
+				if (fread(fileTypeId, 5, 1, file) != 1) {
+					printf("Input file '%s' is too small to be a PSV or VMP file! Skipping...\n", fileNames[i]);
+					fclose(file);
+					continue;
+				}
 				fseek(file, 0, SEEK_SET);
 
-				if (!memcmp(fileTypeId, "\0VSP", 4) && (cFileSize - sizeof(PSVHeader_t)) % sizeof(SaveBlock_t) == 0) {
+				if (!memcmp(fileTypeId, "\0VSP", 4) && cFileSize > (long)sizeof(PSVHeader_t) && (cFileSize - sizeof(PSVHeader_t)) % sizeof(SaveBlock_t) == 0) {
 					printf("Detected '%s' as a PSV file, starting extraction...\n", fileNames[i]);
 
 					PSVFile_t* psvFile = (PSVFile_t*)calloc(1, cFileSize);
-					fread(psvFile, cFileSize, 1, file);
-					ExtractSaveFromPSV(psvFile);
+					if (!psvFile || fread(psvFile, cFileSize, 1, file) != 1) {
+						printf("Failed to read '%s' into memory! Skipping...\n", fileNames[i]);
+						free(psvFile);
+						fclose(file);
+						continue;
+					}
+					ExtractSaveFromPSV(psvFile, cFileSize - sizeof(PSVHeader_t));
 					free(psvFile);
 				}
 				else if (!memcmp(fileTypeId, "\0PMV\x80", 5) && cFileSize == sizeof(VMPFile_t)) {
 					printf("Detected '%s' as a VMP file, starting extraction...\n", fileNames[i]);
 
 					VMPFile_t* vmpFile = (VMPFile_t*)calloc(1, cFileSize);
-					fread(vmpFile, cFileSize, 1, file);
+					if (!vmpFile || fread(vmpFile, cFileSize, 1, file) != 1) {
+						printf("Failed to read '%s' into memory! Skipping...\n", fileNames[i]);
+						free(vmpFile);
+						fclose(file);
+						continue;
+					}
 					ExtractSavesFromVMP(vmpFile);
 					free(vmpFile);
 				}
@@ -561,7 +660,7 @@ int main(int argc, char** argv)
 				}
 			}
 			else if (psv) {
-				if (cFileSize % sizeof(SaveBlock_t) != 0) {
+				if (cFileSize % sizeof(SaveBlock_t) != 0 || cFileSize / sizeof(SaveBlock_t) > MAX_SAVE_BLOCKS) {
 					printf("Input file '%s' is not a valid PS1 block save! Skipping...\n", fileNames[i]);
 					fclose(file);
 					continue;

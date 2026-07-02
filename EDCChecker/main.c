@@ -71,13 +71,14 @@ static inline uint8_t DecodeBCD(uint8_t binaryCodedDecimal)
 	return ((binaryCodedDecimal & 0xF0) >> 4) * 10 + (binaryCodedDecimal & 0x0F);
 }
 
-static inline uint32_t GetSectorNumber(SectorAddress_t* sectAddr)
+static inline int32_t GetSectorNumber(const SectorAddress_t* sectAddr)
 {
 	// Address is stored as MSB (Minute:Second:Block) with decimal values (BCD)
 	// 75 consecutive sectors (blocks) in a CD-ROM second
-	const uint32_t cSectAddr = (DecodeBCD(sectAddr->minutes) * 60 + DecodeBCD(sectAddr->seconds)) * 75 + DecodeBCD(sectAddr->sector);
+	const int32_t cSectAddr = (DecodeBCD(sectAddr->minutes) * 60 + DecodeBCD(sectAddr->seconds)) * 75 + DecodeBCD(sectAddr->sector);
 
-	// Ignore the first 2 seconds which is the pre-gap of any track
+	// Ignore the first 2 seconds which is the pre-gap of any track.
+	// Signed so pre-gap or garbage addresses show as negative instead of underflowing.
 	return cSectAddr - 2 * 75;
 }
 
@@ -118,8 +119,8 @@ int main(int argc, char** argv)
 	bool isVerbose = false;
 
 	const char* fileName = NULL;
-	for (size_t i = 1; i < argc; ++i) {
-		if (!strncmp(argv[i], "-v", 2)) {
+	for (int i = 1; i < argc; ++i) {
+		if (!strcmp(argv[i], "-v")) {
 			isVerbose = true;
 		}
 		else {
@@ -140,25 +141,24 @@ int main(int argc, char** argv)
 	CRCTableInit();
 
 	fseek(file, 0, SEEK_END);
-	long fileSize = ftell(file);
+	const long fileSize = ftell(file);
 	fseek(file, 0, SEEK_SET);
 
-	if (fileSize % SECTOR_SIZE != 0) {
-		puts("Bin file is not a multiple of sector size... File may be corrupted!");
+	if (fileSize <= 0 || fileSize % SECTOR_SIZE != 0) {
+		puts("Bin file is empty or not a multiple of sector size... File may be corrupted!");
 		fclose(file);
 		return 1;
 	}
 
 	bool invalidEDC = false;
 	Sector_t sector;
-	while (!feof(file)) {
-		fread(sector.buffer, 1, SECTOR_SIZE, file);
-
+	while (fread(sector.buffer, 1, SECTOR_SIZE, file) == SECTOR_SIZE) {
 		SectorAddress_t sectAddr = { sector.header[0], sector.header[1], sector.header[2] };
 		if (memcmp(sector.sync, "\x00\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x00", SECTOR_SYNC_SIZE) != 0) {
 			// Incorrect sync sector
 			printf("Found incorrect sync at address %x:%x:%x, sector: %d\n", sectAddr.minutes, sectAddr.seconds, sectAddr.sector, GetSectorNumber(&sectAddr));
 			printf("Please check your bin file for corruption!\n");
+			fclose(file);
 			return 1;
 		}
 
@@ -170,14 +170,14 @@ int main(int argc, char** argv)
 		const uint8_t formType = CheckSubmodeBits(sector.subheader[2], SB_FORM) + 1; // Form 1 returns false (0), Form 2 returns true (1)
 		const uint16_t dataSize = formType == 2 ? SECTOR_FORM2_DATA_SIZE : SECTOR_FORM1_DATA_SIZE;
 
-		uint32_t discCrc;
-		memcpy(&discCrc, &sector.data[dataSize], sizeof(uint32_t));
+		const uint32_t discCrc = (uint32_t)sector.data[dataSize] | ((uint32_t)sector.data[dataSize + 1] << 8)
+		    | ((uint32_t)sector.data[dataSize + 2] << 16) | ((uint32_t)sector.data[dataSize + 3] << 24);
 
-		uint32_t calculatedCrc = CalculateEDC(sector.buffer + SECTOR_SYNC_SIZE + SECTOR_HEADER_SIZE, SECTOR_SUBHEADER_SIZE + dataSize);
+		const uint32_t calculatedCrc = CalculateEDC(sector.buffer + SECTOR_SYNC_SIZE + SECTOR_HEADER_SIZE, SECTOR_SUBHEADER_SIZE + dataSize);
 		if (discCrc != calculatedCrc) {
 			invalidEDC = true;
 			if (isVerbose) {
-				uint32_t sectorNumber = GetSectorNumber(&sectAddr);
+				const int32_t sectorNumber = GetSectorNumber(&sectAddr);
 				printf("Found mismatch at Sector %d, mode %d, form %d\n", sectorNumber, sector.header[3], formType);
 				printf("Found EDC: %X\n", discCrc);
 				printf("Calculated EDC: %X\n", calculatedCrc);

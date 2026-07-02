@@ -8,5 +8,7 @@ set_target_properties(save_converter PROPERTIES
 	RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/bin"
 )
 target_compile_options(save_converter PRIVATE -pedantic-errors)
+# Disable unused AES modes for all translation units so struct AES_ctx has one layout everywhere
+target_compile_definitions(save_converter PRIVATE CTR=0 CBC=0)
 
 install(TARGETS save_converter RUNTIME DESTINATION bin)
